@@ -1,0 +1,5 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "0353630860")(type "KiCad")(uri "${KIPRJMOD}/CON_0353630860.kicad_sym")(options "")(descr ""))
+  (lib (name "AZ1117ID_3_3TRG1")(type "KiCad")(uri "${KIPRJMOD}/AZ1117ID_3_3TRG1.kicad_sym")(options "")(descr ""))
+)
