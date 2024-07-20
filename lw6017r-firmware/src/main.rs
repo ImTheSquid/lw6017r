@@ -5,7 +5,7 @@
 use core::{cell::RefCell, ptr::addr_of_mut};
 
 use critical_section::Mutex;
-use debouncr::{Debouncer, DebouncerStateful, Repeat12};
+use debouncr::{Debouncer, DebouncerStateful, Edge, Repeat12};
 use embassy_executor::Spawner;
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
@@ -28,6 +28,7 @@ use esp_hal::{
     timer::{timg::TimerGroup, ErasedTimer, OneShotTimer},
 };
 use esp_hal_embassy::Executor;
+use esp_println::println;
 use heapless::Vec;
 use static_cell::{make_static, StaticCell};
 
@@ -171,16 +172,20 @@ impl Segments<'_> {
         );
     }
 
-    fn display_leds(&mut self, mode: Mode, timer: bool, remind: bool) {
+    fn display_leds(&mut self, mode: Option<Mode>, timer: bool, remind: bool) {
         self.exec_on_all(|p| p.set_as_output());
 
         let byte = if timer { 1 << 5 } else { 0 }
             | if remind { 1 << 4 } else { 0 }
-            | match mode {
-                Mode::Cool => 1,
-                Mode::EnergySaver => 1 << 1,
-                Mode::Fan => 1 << 2,
-                Mode::Dry => 1 << 3,
+            | if let Some(mode) = mode {
+                match mode {
+                    Mode::Cool => 1,
+                    Mode::EnergySaver => 1 << 1,
+                    Mode::Fan => 1 << 2,
+                    Mode::Dry => 1 << 3,
+                }
+            } else {
+                0
             };
 
         self.byte_power(byte);
@@ -205,8 +210,7 @@ struct DisplayState {
     temp: u8,
     remind: bool,
     timer: Option<u8>,
-    is_on: bool,
-    mode: Mode,
+    mode: Option<Mode>,
     fan: Option<FanSpeed>,
 }
 
@@ -229,7 +233,7 @@ async fn display_task(
                 FanSpeed::Medium => 2,
                 FanSpeed::Low => 1,
             })
-        } else if state.is_on {
+        } else if state.mode.is_some() {
             Some(state.temp)
         } else {
             state.timer
@@ -358,7 +362,7 @@ async fn main(_spawner: Spawner) -> ! {
     });
 
     loop {
-        log::info!("Hello world!");
+        log::info!("HEARTBEAT");
         Timer::after_millis(500).await;
         if let Ok(ButtonStatus {
             temp_up,
@@ -382,7 +386,7 @@ async fn main(_spawner: Spawner) -> ! {
                     state.timer_button.update(timer),
                 ]
                 .iter()
-                .any(|e| e.is_some());
+                .any(|e| e.is_some_and(|e| matches!(e, Edge::Rising)));
 
                 if interrupt {
                     let mut binding = IRQ_N.borrow_ref_mut(cs);
@@ -585,6 +589,41 @@ fn stb_handler() {
                         page,
                     } => {
                         validate_write_address(address, page);
+
+                        match page {
+                            0 => {
+                                if address <= 1 {
+                                    println!("recv display byte 0b{byte:08b}");
+                                } else {
+                                    println!("Received display byte 0b{byte:08b} at address 0x{address:02x} outside of displayable range, ignoring");
+                                }
+                            }
+                            1 => {
+                                if byte & 0b11001100 != 0 {
+                                    state.config.mode = match byte & 0b11001100 {
+                                        128 => Mode::Cool,
+                                        64 => Mode::Dry,
+                                        8 => Mode::Fan,
+                                        4 => Mode::EnergySaver,
+                                        _ => unreachable!(),
+                                    };
+                                    state.config.on = true;
+                                } else {
+                                    state.config.on = false;
+                                }
+
+                                state.config.replace = byte & 1 != 0;
+
+                                // Deal with timer elsewhere
+                            }
+                            0x10 | 0x11 => {
+                                // Config information, not necessary
+                                println!(
+                                    "Received config byte 0b{byte:08b} at page 0x{page:02x} address 0x{address:02x}, ignoring"
+                                );
+                            }
+                            _ => unreachable!(),
+                        }
 
                         if !fixed {
                             parse_state = CommandParseState::Write {
