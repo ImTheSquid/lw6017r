@@ -20,7 +20,7 @@ use esp_hal::{
     delay::Delay,
     gpio::{
         AnyFlex, Event, Flex, Gpio10, Gpio11, Gpio12, Gpio13, Gpio14, Gpio17, Gpio18, Gpio2,
-        Gpio21, Gpio4, Gpio45, Gpio5, Gpio7, Gpio8, Gpio9, Input, Io, Level, Output, Pull,
+        Gpio21, Gpio4, Gpio45, Gpio5, Gpio6, Gpio7, Gpio8, Gpio9, Input, Io, Level, Output, Pull,
     },
     peripherals::Peripherals,
     prelude::*,
@@ -55,17 +55,27 @@ struct Config {
     timer: u8,
     replace: bool,
     mode: Mode,
+    on: bool,
 }
 
 struct State {
     power_button: ButtonDebouncer,
     fan_button: ButtonDebouncer,
     mode_button: ButtonDebouncer,
+    up_button: ButtonDebouncer,
+    down_button: ButtonDebouncer,
+    timer_button: ButtonDebouncer,
+    config: Config,
 }
 
 static STB: Mutex<RefCell<Option<Input<Gpio5>>>> = Mutex::new(RefCell::new(None));
-static DATA: Mutex<RefCell<Option<Input<Gpio2>>>> = Mutex::new(RefCell::new(None));
+static DATA: Mutex<RefCell<Option<Flex<Gpio2>>>> = Mutex::new(RefCell::new(None));
 static CLK: Mutex<RefCell<Option<Input<Gpio4>>>> = Mutex::new(RefCell::new(None));
+static IRQ_N: Mutex<RefCell<Option<Output<Gpio6>>>> = Mutex::new(RefCell::new(None));
+static STATE: Mutex<RefCell<Option<State>>> = Mutex::new(RefCell::new(None));
+static DISPLAY_CHANNEL_SEND: Mutex<
+    RefCell<Option<Sender<CriticalSectionRawMutex, DisplayState, 1>>>,
+> = Mutex::new(RefCell::new(None));
 
 struct Segments<'d> {
     seg0: AnyFlex<'d>,
@@ -150,11 +160,21 @@ impl Segments<'_> {
         );
     }
 
+    fn display_letter(&mut self, c: char, dp: bool) {
+        self.exec_on_all(|p| p.set_as_output());
+
+        self.byte_power(
+            match c {
+                'F' => 0b01110001,
+                _ => unimplemented!(),
+            } | if dp { 1 << 7 } else { 0 },
+        );
+    }
+
     fn display_leds(&mut self, mode: Mode, timer: bool, remind: bool) {
         self.exec_on_all(|p| p.set_as_output());
 
-        let byte = 0_u8
-            | if timer { 1 << 5 } else { 0 }
+        let byte = if timer { 1 << 5 } else { 0 }
             | if remind { 1 << 4 } else { 0 }
             | match mode {
                 Mode::Cool => 1,
@@ -187,6 +207,7 @@ struct DisplayState {
     timer: Option<u8>,
     is_on: bool,
     mode: Mode,
+    fan: Option<FanSpeed>,
 }
 
 #[embassy_executor::task]
@@ -202,21 +223,29 @@ async fn display_task(
     let mut state = DisplayState::default();
 
     loop {
-        let num = if state.is_on {
+        let num = if let Some(fan) = state.fan {
+            Some(match fan {
+                FanSpeed::High => 3,
+                FanSpeed::Medium => 2,
+                FanSpeed::Low => 1,
+            })
+        } else if state.is_on {
             Some(state.temp)
-        } else if let Some(time) = state.timer {
-            Some(time)
         } else {
-            None
+            state.timer
         };
         if let Some(num) = num {
             digit1.set_high();
-            segments.display_number(num % 10, false);
+            if num <= 3 {
+                segments.display_letter('F', false);
+            } else {
+                segments.display_number(num / 10, false);
+            }
             Timer::after_micros(64).await;
             digit1.set_low();
 
             digit2.set_high();
-            segments.display_number(num / 10, false);
+            segments.display_number(num % 10, false);
             Timer::after_micros(64).await;
             digit2.set_low();
         }
@@ -237,8 +266,6 @@ async fn display_task(
         }
     }
 }
-
-fn send_data() {}
 
 static mut APP_CORE_STACK: Stack<4096> = Stack::new();
 
@@ -267,17 +294,10 @@ async fn main(_spawner: Spawner) -> ! {
     // Setup data lines
     let _comm_enable = Output::new(io.pins.gpio1, Level::High);
     let mut stb = Input::new(io.pins.gpio5, Pull::Up);
-    let data = Input::new(io.pins.gpio2, Pull::Up);
+    let mut data = Flex::new(io.pins.gpio2);
+    data.set_as_input(Pull::Up);
     let clk = Input::new(io.pins.gpio4, Pull::None);
     let irq_n = Output::new(io.pins.gpio6, Level::High);
-
-    // STB interrupt to get data from controller
-    critical_section::with(|cs| {
-        stb.listen(Event::FallingEdge);
-        STB.borrow_ref_mut(cs).replace(stb);
-        DATA.borrow_ref_mut(cs).replace(data);
-        CLK.borrow_ref_mut(cs).replace(clk);
-    });
 
     // Setup buttons
     let buttons = Output::new(io.pins.gpio45, Level::Low);
@@ -300,10 +320,23 @@ async fn main(_spawner: Spawner) -> ! {
     // Channels
     let display_channel: Channel<CriticalSectionRawMutex, DisplayState, 1> = Channel::new();
     let display_channel = make_static!(display_channel);
+    let display_channel_send = display_channel.sender();
     let display_channel_recv = display_channel.receiver();
     let button_channel: Channel<CriticalSectionRawMutex, ButtonStatus, 1> = Channel::new();
     let button_channel = make_static!(button_channel);
     let button_channel_send = button_channel.sender();
+    let button_channel_recv = button_channel.receiver();
+
+    critical_section::with(|cs| {
+        stb.listen(Event::FallingEdge);
+        STB.borrow_ref_mut(cs).replace(stb);
+        DATA.borrow_ref_mut(cs).replace(data);
+        CLK.borrow_ref_mut(cs).replace(clk);
+        IRQ_N.borrow_ref_mut(cs).replace(irq_n);
+        DISPLAY_CHANNEL_SEND
+            .borrow_ref_mut(cs)
+            .replace(display_channel_send);
+    });
 
     // Spin off display process
     let _guard = cpu.start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, move || {
@@ -327,6 +360,37 @@ async fn main(_spawner: Spawner) -> ! {
     loop {
         log::info!("Hello world!");
         Timer::after_millis(500).await;
+        if let Ok(ButtonStatus {
+            temp_up,
+            temp_down,
+            power,
+            timer,
+            mode,
+            fan,
+        }) = button_channel_recv.try_receive()
+        {
+            critical_section::with(|cs| {
+                let mut binding = STATE.borrow_ref_mut(cs);
+                let state = binding.as_mut().unwrap();
+
+                let interrupt = [
+                    state.power_button.update(power),
+                    state.fan_button.update(fan),
+                    state.up_button.update(temp_up),
+                    state.down_button.update(temp_down),
+                    state.mode_button.update(mode),
+                    state.timer_button.update(timer),
+                ]
+                .iter()
+                .any(|e| e.is_some());
+
+                if interrupt {
+                    let mut binding = IRQ_N.borrow_ref_mut(cs);
+                    let irq_n = binding.as_mut().unwrap();
+                    irq_n.set_high();
+                }
+            });
+        }
     }
 }
 
@@ -336,8 +400,6 @@ struct ByteBaker {
     byte: u8,
     offset: u8,
 }
-
-const MAX_COMMAND_LEN: usize = 9;
 
 impl ByteBaker {
     fn bake(&mut self, bit: bool) -> Option<u8> {
@@ -355,19 +417,56 @@ impl ByteBaker {
     }
 }
 
+enum CommandParseState {
+    NoCommand,
+    Write { fixed: bool, address: u8, page: u8 },
+    Read { fixed: bool, address: u8, page: u8 },
+}
+
+fn validate_write_address(address: u8, page: u8) {
+    let res = match page {
+        // 7 segment
+        0x00 => address <= 0x05,
+        // LED
+        0x01 => address == 0,
+        // Config
+        0x10 | 0x11 => address <= 0x03,
+        _ => false,
+    };
+
+    if !res {
+        panic!("Invalid write to {address} on page {page}");
+    }
+}
+
+fn validate_read_address(address: u8, page: u8) {
+    let res = page == 1 && address <= 2;
+
+    if !res {
+        panic!("Invalid read from {address} on page {page}");
+    }
+}
+
 #[handler]
 fn stb_handler() {
     critical_section::with(|cs| {
         // Start handling clock bits
         let mut binding = STB.borrow_ref_mut(cs);
         let stb = binding.as_mut().unwrap();
-        let binding = DATA.borrow_ref(cs);
-        let data = binding.as_ref().unwrap();
+        let mut binding = DATA.borrow_ref_mut(cs);
+        let data = binding.as_mut().unwrap();
         let binding = CLK.borrow_ref(cs);
         let clk = binding.as_ref().unwrap();
+        let mut binding = STATE.borrow_ref_mut(cs);
+        let state = binding.as_mut().unwrap();
+        let mut binding = IRQ_N.borrow_ref_mut(cs);
+        let irq_n = binding.as_mut().unwrap();
 
-        let mut recv_buf: Vec<u8, MAX_COMMAND_LEN> = Vec::new();
+        data.set_as_input(Pull::Up);
+
         let mut baker = ByteBaker::default();
+
+        let mut parse_state = CommandParseState::NoCommand;
 
         while stb.is_low() {
             // Wait for clk to go low
@@ -380,7 +479,122 @@ fn stb_handler() {
 
             // Read some data
             if let Some(byte) = baker.bake(data.is_high()) {
-                recv_buf.push(byte).expect("byte should have room to push");
+                // Check for obvious commands first, then fallback to state
+                match parse_state {
+                    CommandParseState::NoCommand => match byte & 0b01011111 {
+                        0b00001101 => {
+                            state.config.on = true;
+                        }
+                        0b00001110 => {
+                            state.config.on = false;
+                        }
+                        _ => {
+                            // At this point it has to be a read or write command, so extract necessary info
+                            let fixed = byte & 0b00100000 > 0;
+                            let address = byte & 0b111;
+                            let page = byte & 0b11000 >> 3;
+
+                            if byte & 0b01000000 > 0 {
+                                parse_state = CommandParseState::Read {
+                                    fixed,
+                                    address,
+                                    page,
+                                };
+                            } else {
+                                parse_state = CommandParseState::Write {
+                                    fixed,
+                                    address,
+                                    page,
+                                };
+                            }
+                        }
+                    },
+                    CommandParseState::Read {
+                        fixed,
+                        address,
+                        page,
+                    } => {
+                        validate_read_address(address, page);
+
+                        data.set_as_output();
+
+                        let out = match address {
+                            0 => {
+                                let out = state.config.replace as u8
+                                    | (matches!(state.config.mode, Mode::EnergySaver) as u8) << 2
+                                    | (matches!(state.config.mode, Mode::Fan) as u8) << 3
+                                    | ((state.config.timer > 0) as u8) << 5
+                                    | (matches!(state.config.mode, Mode::Dry) as u8) << 6
+                                    | (matches!(state.config.mode, Mode::Cool) as u8) << 7;
+
+                                out
+                            }
+                            1 => {
+                                let out = state.fan_button.is_high() as u8
+                                    | (state.down_button.is_high() as u8) << 2
+                                    | (state.up_button.is_high() as u8) << 3;
+                                out
+                            }
+                            2 => {
+                                let out = state.timer_button.is_high() as u8
+                                    | (state.mode_button.is_high() as u8) << 1
+                                    | (state.power_button.is_high() as u8) << 2;
+                                out
+                            }
+                            _ => unreachable!(),
+                        };
+
+                        for i in 0_u8..8 {
+                            while clk.is_low() && stb.is_low() {}
+
+                            if stb.is_high() {
+                                break;
+                            }
+
+                            data.set_level(if out >> i & 1 == 1 {
+                                Level::High
+                            } else {
+                                Level::Low
+                            });
+
+                            // Data is clocked out at falling edge
+                            while clk.is_high() && stb.is_low() {}
+
+                            if stb.is_high() {
+                                break;
+                            }
+                        }
+
+                        data.set_as_input(Pull::Up);
+
+                        if address == 2 {
+                            irq_n.set_low();
+                        }
+
+                        if !fixed {
+                            parse_state = CommandParseState::Read {
+                                fixed,
+                                address: address + 1,
+                                page,
+                            };
+                        }
+                    }
+                    CommandParseState::Write {
+                        fixed,
+                        address,
+                        page,
+                    } => {
+                        validate_write_address(address, page);
+
+                        if !fixed {
+                            parse_state = CommandParseState::Write {
+                                fixed,
+                                address: address + 1,
+                                page,
+                            };
+                        }
+                    }
+                }
             }
 
             // Wait for clk to go high
