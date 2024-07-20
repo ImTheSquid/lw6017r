@@ -5,7 +5,10 @@
 use core::{cell::RefCell, ptr::addr_of_mut};
 
 use critical_section::Mutex;
-use debouncr::{Debouncer, DebouncerStateful, Edge, Repeat12};
+use debouncr::{
+    debounce_stateful_12, debounce_stateful_2, debounce_stateful_4, Debouncer, DebouncerStateful,
+    Edge, Repeat12, Repeat2, Repeat4, Repeat6,
+};
 use embassy_executor::Spawner;
 use embassy_sync::{
     blocking_mutex::raw::CriticalSectionRawMutex,
@@ -32,7 +35,7 @@ use esp_println::println;
 use heapless::Vec;
 use static_cell::{make_static, StaticCell};
 
-type ButtonDebouncer = DebouncerStateful<u16, Repeat12>;
+type ButtonDebouncer = DebouncerStateful<u8, Repeat2>;
 
 #[derive(Debug, Clone, Copy)]
 enum FanSpeed {
@@ -137,13 +140,11 @@ impl Segments<'_> {
     }
 
     fn byte_power(&mut self, power: u8) {
-        self.exec_on_some(|p| p.set_high(), power);
-        self.exec_on_some(|p| p.set_low(), !power);
+        self.exec_on_some(|p| p.set_low(), power);
+        self.exec_on_some(|p| p.set_high(), !power);
     }
 
     fn display_number(&mut self, num: u8, dp: bool) {
-        self.exec_on_all(|p| p.set_as_output());
-
         self.byte_power(
             match num {
                 0 => 0b00111111,
@@ -162,8 +163,6 @@ impl Segments<'_> {
     }
 
     fn display_letter(&mut self, c: char, dp: bool) {
-        self.exec_on_all(|p| p.set_as_output());
-
         self.byte_power(
             match c {
                 'F' => 0b01110001,
@@ -173,8 +172,6 @@ impl Segments<'_> {
     }
 
     fn display_leds(&mut self, mode: Option<Mode>, timer: bool, remind: bool) {
-        self.exec_on_all(|p| p.set_as_output());
-
         let byte = if timer { 1 << 5 } else { 0 }
             | if remind { 1 << 4 } else { 0 }
             | if let Some(mode) = mode {
@@ -192,8 +189,6 @@ impl Segments<'_> {
     }
 
     fn read_buttons(&mut self) -> ButtonStatus {
-        self.exec_on_all(|p| p.set_as_input(Pull::Down));
-
         ButtonStatus {
             temp_up: self.seg4.is_high(),
             temp_down: self.seg5.is_high(),
@@ -214,19 +209,22 @@ struct DisplayState {
     fan: Option<FanSpeed>,
 }
 
+const DELAY: u64 = 750;
+
 #[embassy_executor::task]
 async fn display_task(
     mut segments: Segments<'static>,
     mut digit1: Output<'static, Gpio7>,
     mut digit2: Output<'static, Gpio8>,
     mut leds: Output<'static, Gpio9>,
-    mut buttons: Output<'static, Gpio45>,
+    mut buttons: Flex<'static, Gpio45>,
     state_recv: Receiver<'static, CriticalSectionRawMutex, DisplayState, 1>,
     button_alert: Sender<'static, CriticalSectionRawMutex, ButtonStatus, 1>,
 ) -> ! {
     let mut state = DisplayState::default();
 
     loop {
+        segments.exec_on_all(|p| p.set_as_open_drain(Pull::None));
         let num = if let Some(fan) = state.fan {
             Some(match fan {
                 FanSpeed::High => 3,
@@ -245,25 +243,27 @@ async fn display_task(
             } else {
                 segments.display_number(num / 10, false);
             }
-            Timer::after_micros(64).await;
+            Timer::after_micros(DELAY).await;
             digit1.set_low();
 
             digit2.set_high();
             segments.display_number(num % 10, false);
-            Timer::after_micros(64).await;
+            Timer::after_micros(DELAY).await;
             digit2.set_low();
         }
 
         leds.set_high();
         segments.display_leds(state.mode, state.timer.is_some(), state.remind);
-        Timer::after_micros(64).await;
+        Timer::after_micros(DELAY).await;
         leds.set_low();
 
+        segments.exec_on_all(|p| p.set_as_input(Pull::Down));
+        buttons.set_as_output();
         buttons.set_high();
         let button = segments.read_buttons();
-        Timer::after_micros(64).await;
-        buttons.set_low();
-        button_alert.send(button).await;
+        Timer::after_micros(DELAY).await;
+        buttons.set_as_open_drain(Pull::None);
+        let _ = button_alert.try_send(button);
 
         if let Ok(s) = state_recv.try_receive() {
             state = s;
@@ -296,7 +296,6 @@ async fn main(_spawner: Spawner) -> ! {
     io.set_interrupt_handler(stb_handler);
 
     // Setup data lines
-    let _comm_enable = Output::new(io.pins.gpio1, Level::High);
     let mut stb = Input::new(io.pins.gpio5, Pull::Up);
     let mut data = Flex::new(io.pins.gpio2);
     data.set_as_input(Pull::Up);
@@ -304,7 +303,7 @@ async fn main(_spawner: Spawner) -> ! {
     let irq_n = Output::new(io.pins.gpio6, Level::High);
 
     // Setup buttons
-    let buttons = Output::new(io.pins.gpio45, Level::Low);
+    let buttons = Flex::new(io.pins.gpio45);
 
     // Setup segments
     let digit1 = Output::new(io.pins.gpio7, Level::Low);
@@ -331,6 +330,33 @@ async fn main(_spawner: Spawner) -> ! {
     let button_channel_send = button_channel.sender();
     let button_channel_recv = button_channel.receiver();
 
+    let state = State {
+        up_button: debounce_stateful_2(false),
+        down_button: debounce_stateful_2(false),
+        power_button: debounce_stateful_2(false),
+        mode_button: debounce_stateful_2(false),
+        timer_button: debounce_stateful_2(false),
+        fan_button: debounce_stateful_2(false),
+        config: Config {
+            temperature: 72,
+            fan_speed: FanSpeed::Low,
+            timer: 0,
+            replace: true,
+            mode: Mode::EnergySaver,
+            on: true,
+        },
+    };
+
+    display_channel_send
+        .send(DisplayState {
+            temp: state.config.temperature,
+            remind: state.config.replace,
+            timer: None,
+            mode: Some(state.config.mode),
+            fan: None,
+        })
+        .await;
+
     critical_section::with(|cs| {
         stb.listen(Event::FallingEdge);
         STB.borrow_ref_mut(cs).replace(stb);
@@ -340,6 +366,7 @@ async fn main(_spawner: Spawner) -> ! {
         DISPLAY_CHANNEL_SEND
             .borrow_ref_mut(cs)
             .replace(display_channel_send);
+        STATE.borrow_ref_mut(cs).replace(state);
     });
 
     // Spin off display process
@@ -361,6 +388,8 @@ async fn main(_spawner: Spawner) -> ! {
         });
     });
 
+    let _comm_enable = Output::new(io.pins.gpio1, Level::High);
+
     loop {
         log::info!("HEARTBEAT");
         Timer::after_millis(500).await;
@@ -373,6 +402,7 @@ async fn main(_spawner: Spawner) -> ! {
             fan,
         }) = button_channel_recv.try_receive()
         {
+            println!("received button update {temp_up} {temp_down} {power} {timer} {mode} {fan}");
             critical_section::with(|cs| {
                 let mut binding = STATE.borrow_ref_mut(cs);
                 let state = binding.as_mut().unwrap();
@@ -398,16 +428,37 @@ async fn main(_spawner: Spawner) -> ! {
     }
 }
 
+#[allow(unused)]
+#[derive(Debug)]
+enum Order {
+    MostSignificant,
+    LeastSignificant,
+}
+
 /// Bakes a byte by adding in bits
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct ByteBaker {
     byte: u8,
     offset: u8,
+    order: Order,
 }
 
 impl ByteBaker {
+    fn new(order: Order) -> Self {
+        Self {
+            byte: 0,
+            offset: 0,
+            order,
+        }
+    }
+
     fn bake(&mut self, bit: bool) -> Option<u8> {
-        self.byte |= (bit as u8) << self.offset;
+        let order_offset = match self.order {
+            Order::LeastSignificant => self.offset,
+            Order::MostSignificant => 7 - self.offset,
+        };
+
+        self.byte |= (bit as u8) << order_offset;
 
         if self.offset == 7 {
             let copy = self.byte;
@@ -421,6 +472,7 @@ impl ByteBaker {
     }
 }
 
+#[derive(Debug)]
 enum CommandParseState {
     NoCommand,
     Write { fixed: bool, address: u8, page: u8 },
@@ -430,11 +482,11 @@ enum CommandParseState {
 fn validate_write_address(address: u8, page: u8) {
     let res = match page {
         // 7 segment
-        0x00 => address <= 0x05,
+        0b00 => address <= 0x05,
         // LED
-        0x01 => address == 0,
+        0b01 => address == 0,
         // Config
-        0x10 | 0x11 => address <= 0x03,
+        0b10 | 0b11 => address <= 0x03,
         _ => false,
     };
 
@@ -451,8 +503,9 @@ fn validate_read_address(address: u8, page: u8) {
     }
 }
 
-#[handler]
+#[handler(priority = esp_hal::interrupt::Priority::Priority3)]
 fn stb_handler() {
+    // println!("interrupt");
     critical_section::with(|cs| {
         // Start handling clock bits
         let mut binding = STB.borrow_ref_mut(cs);
@@ -468,7 +521,7 @@ fn stb_handler() {
 
         data.set_as_input(Pull::Up);
 
-        let mut baker = ByteBaker::default();
+        let mut baker = ByteBaker::new(Order::LeastSignificant);
 
         let mut parse_state = CommandParseState::NoCommand;
 
@@ -483,6 +536,7 @@ fn stb_handler() {
 
             // Read some data
             if let Some(byte) = baker.bake(data.is_high()) {
+                // println!("parsed byte 0b{byte:08b}");
                 // Check for obvious commands first, then fallback to state
                 match parse_state {
                     CommandParseState::NoCommand => match byte & 0b01011111 {
@@ -496,7 +550,7 @@ fn stb_handler() {
                             // At this point it has to be a read or write command, so extract necessary info
                             let fixed = byte & 0b00100000 > 0;
                             let address = byte & 0b111;
-                            let page = byte & 0b11000 >> 3;
+                            let page = (byte & 0b11000) >> 3;
 
                             if byte & 0b01000000 > 0 {
                                 parse_state = CommandParseState::Read {
@@ -511,6 +565,8 @@ fn stb_handler() {
                                     page,
                                 };
                             }
+
+                            // println!("parsed command {parse_state:?}");
                         }
                     },
                     CommandParseState::Read {
@@ -524,26 +580,22 @@ fn stb_handler() {
 
                         let out = match address {
                             0 => {
-                                let out = state.config.replace as u8
+                                state.config.replace as u8
                                     | (matches!(state.config.mode, Mode::EnergySaver) as u8) << 2
                                     | (matches!(state.config.mode, Mode::Fan) as u8) << 3
                                     | ((state.config.timer > 0) as u8) << 5
                                     | (matches!(state.config.mode, Mode::Dry) as u8) << 6
-                                    | (matches!(state.config.mode, Mode::Cool) as u8) << 7;
-
-                                out
+                                    | (matches!(state.config.mode, Mode::Cool) as u8) << 7
                             }
                             1 => {
-                                let out = state.fan_button.is_high() as u8
+                                state.fan_button.is_high() as u8
                                     | (state.down_button.is_high() as u8) << 2
-                                    | (state.up_button.is_high() as u8) << 3;
-                                out
+                                    | (state.up_button.is_high() as u8) << 3
                             }
                             2 => {
-                                let out = state.timer_button.is_high() as u8
+                                state.timer_button.is_high() as u8
                                     | (state.mode_button.is_high() as u8) << 1
-                                    | (state.power_button.is_high() as u8) << 2;
-                                out
+                                    | (state.power_button.is_high() as u8) << 2
                             }
                             _ => unreachable!(),
                         };
