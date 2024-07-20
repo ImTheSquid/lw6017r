@@ -476,7 +476,6 @@ impl ByteBaker {
 enum CommandParseState {
     NoCommand,
     Write { fixed: bool, address: u8, page: u8 },
-    Read { fixed: bool, address: u8, page: u8 },
 }
 
 fn validate_write_address(address: u8, page: u8) {
@@ -549,15 +548,73 @@ fn stb_handler() {
                         _ => {
                             // At this point it has to be a read or write command, so extract necessary info
                             let fixed = byte & 0b00100000 > 0;
-                            let address = byte & 0b111;
+                            let mut address = byte & 0b111;
                             let page = (byte & 0b11000) >> 3;
 
                             if byte & 0b01000000 > 0 {
-                                parse_state = CommandParseState::Read {
-                                    fixed,
-                                    address,
-                                    page,
-                                };
+                                while stb.is_low() {
+                                    validate_read_address(address, page);
+
+                                    data.set_as_output();
+
+                                    let out = match address {
+                                        0 => {
+                                            state.config.replace as u8
+                                                | (matches!(state.config.mode, Mode::EnergySaver)
+                                                    as u8)
+                                                    << 2
+                                                | (matches!(state.config.mode, Mode::Fan) as u8)
+                                                    << 3
+                                                | ((state.config.timer > 0) as u8) << 5
+                                                | (matches!(state.config.mode, Mode::Dry) as u8)
+                                                    << 6
+                                                | (matches!(state.config.mode, Mode::Cool) as u8)
+                                                    << 7
+                                        }
+                                        1 => {
+                                            state.fan_button.is_high() as u8
+                                                | (state.down_button.is_high() as u8) << 2
+                                                | (state.up_button.is_high() as u8) << 3
+                                        }
+                                        2 => {
+                                            state.timer_button.is_high() as u8
+                                                | (state.mode_button.is_high() as u8) << 1
+                                                | (state.power_button.is_high() as u8) << 2
+                                        }
+                                        _ => unreachable!(),
+                                    };
+
+                                    for i in 0_u8..8 {
+                                        while clk.is_low() && stb.is_low() {}
+
+                                        if stb.is_high() {
+                                            break;
+                                        }
+
+                                        data.set_level(if out >> i & 1 == 1 {
+                                            Level::High
+                                        } else {
+                                            Level::Low
+                                        });
+
+                                        // Data is clocked out at falling edge
+                                        while clk.is_high() && stb.is_low() {}
+
+                                        if stb.is_high() {
+                                            break;
+                                        }
+                                    }
+
+                                    data.set_as_input(Pull::Up);
+
+                                    if address == 2 {
+                                        irq_n.set_low();
+                                    }
+
+                                    if !fixed {
+                                        address += 1;
+                                    }
+                                }
                             } else {
                                 parse_state = CommandParseState::Write {
                                     fixed,
@@ -565,76 +622,8 @@ fn stb_handler() {
                                     page,
                                 };
                             }
-
-                            // println!("parsed command {parse_state:?}");
                         }
                     },
-                    CommandParseState::Read {
-                        fixed,
-                        address,
-                        page,
-                    } => {
-                        validate_read_address(address, page);
-
-                        data.set_as_output();
-
-                        let out = match address {
-                            0 => {
-                                state.config.replace as u8
-                                    | (matches!(state.config.mode, Mode::EnergySaver) as u8) << 2
-                                    | (matches!(state.config.mode, Mode::Fan) as u8) << 3
-                                    | ((state.config.timer > 0) as u8) << 5
-                                    | (matches!(state.config.mode, Mode::Dry) as u8) << 6
-                                    | (matches!(state.config.mode, Mode::Cool) as u8) << 7
-                            }
-                            1 => {
-                                state.fan_button.is_high() as u8
-                                    | (state.down_button.is_high() as u8) << 2
-                                    | (state.up_button.is_high() as u8) << 3
-                            }
-                            2 => {
-                                state.timer_button.is_high() as u8
-                                    | (state.mode_button.is_high() as u8) << 1
-                                    | (state.power_button.is_high() as u8) << 2
-                            }
-                            _ => unreachable!(),
-                        };
-
-                        for i in 0_u8..8 {
-                            while clk.is_low() && stb.is_low() {}
-
-                            if stb.is_high() {
-                                break;
-                            }
-
-                            data.set_level(if out >> i & 1 == 1 {
-                                Level::High
-                            } else {
-                                Level::Low
-                            });
-
-                            // Data is clocked out at falling edge
-                            while clk.is_high() && stb.is_low() {}
-
-                            if stb.is_high() {
-                                break;
-                            }
-                        }
-
-                        data.set_as_input(Pull::Up);
-
-                        if address == 2 {
-                            irq_n.set_low();
-                        }
-
-                        if !fixed {
-                            parse_state = CommandParseState::Read {
-                                fixed,
-                                address: address + 1,
-                                page,
-                            };
-                        }
-                    }
                     CommandParseState::Write {
                         fixed,
                         address,
