@@ -35,7 +35,7 @@ use esp_println::println;
 use heapless::Vec;
 use static_cell::{make_static, StaticCell};
 
-type ButtonDebouncer = DebouncerStateful<u8, Repeat2>;
+type ButtonDebouncer = DebouncerStateful<u16, Repeat12>;
 
 #[derive(Debug, Clone, Copy)]
 enum FanSpeed {
@@ -209,7 +209,7 @@ struct DisplayState {
     fan: Option<FanSpeed>,
 }
 
-const DELAY: u64 = 750;
+const DELAY: u64 = 500;
 
 #[embassy_executor::task]
 async fn display_task(
@@ -331,12 +331,12 @@ async fn main(_spawner: Spawner) -> ! {
     let button_channel_recv = button_channel.receiver();
 
     let state = State {
-        up_button: debounce_stateful_2(false),
-        down_button: debounce_stateful_2(false),
-        power_button: debounce_stateful_2(false),
-        mode_button: debounce_stateful_2(false),
-        timer_button: debounce_stateful_2(false),
-        fan_button: debounce_stateful_2(false),
+        up_button: debounce_stateful_12(false),
+        down_button: debounce_stateful_12(false),
+        power_button: debounce_stateful_12(false),
+        mode_button: debounce_stateful_12(false),
+        timer_button: debounce_stateful_12(false),
+        fan_button: debounce_stateful_12(false),
         config: Config {
             temperature: 72,
             fan_speed: FanSpeed::Low,
@@ -391,8 +391,8 @@ async fn main(_spawner: Spawner) -> ! {
     let _comm_enable = Output::new(io.pins.gpio1, Level::High);
 
     loop {
-        log::info!("HEARTBEAT");
-        Timer::after_millis(500).await;
+        // log::info!("HEARTBEAT");
+        Timer::after_micros(DELAY).await;
         if let Ok(ButtonStatus {
             temp_up,
             temp_down,
@@ -402,7 +402,6 @@ async fn main(_spawner: Spawner) -> ! {
             fan,
         }) = button_channel_recv.try_receive()
         {
-            println!("received button update {temp_up} {temp_down} {power} {timer} {mode} {fan}");
             critical_section::with(|cs| {
                 let mut binding = STATE.borrow_ref_mut(cs);
                 let state = binding.as_mut().unwrap();
@@ -414,11 +413,14 @@ async fn main(_spawner: Spawner) -> ! {
                     state.down_button.update(temp_down),
                     state.mode_button.update(mode),
                     state.timer_button.update(timer),
-                ]
-                .iter()
-                .any(|e| e.is_some_and(|e| matches!(e, Edge::Rising)));
+                ];
+
+                let interrupt = interrupt
+                    .iter()
+                    .any(|e| e.is_some_and(|e| matches!(e, Edge::Rising)));
 
                 if interrupt {
+                    log::info!("Button pressed, setting interrupt");
                     let mut binding = IRQ_N.borrow_ref_mut(cs);
                     let irq_n = binding.as_mut().unwrap();
                     irq_n.set_high();
@@ -478,7 +480,7 @@ enum CommandParseState {
     Write { fixed: bool, address: u8, page: u8 },
 }
 
-fn validate_write_address(address: u8, page: u8) {
+fn validate_write_address(address: u8, page: u8) -> bool {
     let res = match page {
         // 7 segment
         0b00 => address <= 0x05,
@@ -490,21 +492,25 @@ fn validate_write_address(address: u8, page: u8) {
     };
 
     if !res {
-        panic!("Invalid write to {address} on page {page}");
+        log::error!("Invalid write to address {address} on page {page}");
     }
+
+    res
 }
 
-fn validate_read_address(address: u8, page: u8) {
+fn validate_read_address(address: u8, page: u8) -> bool {
     let res = page == 1 && address <= 2;
 
     if !res {
-        panic!("Invalid read from {address} on page {page}");
+        log::error!("Invalid read from address {address} on page {page}");
     }
+
+    res
 }
 
 #[handler(priority = esp_hal::interrupt::Priority::Priority3)]
 fn stb_handler() {
-    // println!("interrupt");
+    println!("interrupt");
     critical_section::with(|cs| {
         // Start handling clock bits
         let mut binding = STB.borrow_ref_mut(cs);
@@ -535,7 +541,7 @@ fn stb_handler() {
 
             // Read some data
             if let Some(byte) = baker.bake(data.is_high()) {
-                // println!("parsed byte 0b{byte:08b}");
+                println!("parsed byte 0b{byte:08b}");
                 // Check for obvious commands first, then fallback to state
                 match parse_state {
                     CommandParseState::NoCommand => match byte & 0b01011111 {
@@ -553,7 +559,9 @@ fn stb_handler() {
 
                             if byte & 0b01000000 > 0 {
                                 while stb.is_low() {
-                                    validate_read_address(address, page);
+                                    if !validate_read_address(address, page) {
+                                        break;
+                                    }
 
                                     data.set_as_output();
 
@@ -611,6 +619,11 @@ fn stb_handler() {
                                         irq_n.set_low();
                                     }
 
+                                    while clk.is_high() && stb.is_low() {}
+                                    if stb.is_high() {
+                                        break;
+                                    }
+
                                     if !fixed {
                                         address += 1;
                                     }
@@ -629,7 +642,9 @@ fn stb_handler() {
                         address,
                         page,
                     } => {
-                        validate_write_address(address, page);
+                        if !validate_write_address(address, page) {
+                            break;
+                        }
 
                         match page {
                             0 => {
