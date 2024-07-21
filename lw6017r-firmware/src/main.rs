@@ -37,6 +37,23 @@ use static_cell::{make_static, StaticCell};
 
 type ButtonDebouncer = DebouncerStateful<u16, Repeat12>;
 
+const DIGIT_PARSE_MAP: [u8; 10] = [
+    0b00111111, 0b00000110, 0b10101101, 0b10101110, 0b10010110, 0b10111010, 0b10111011, 0b00100110,
+    0b10111111, 0b10111110,
+];
+
+const PARSE_MASK: u8 = 1 << 6;
+
+const F_PARSE: u8 = 0b10110001;
+
+const REMIND_FLAG: u8 = 1 << 0;
+const ENERGY_SAVER_FLAG: u8 = 1 << 2;
+const DRY_FLAG: u8 = 1 << 3;
+const TIMER_FLAG: u8 = 1 << 5;
+const FAN_FLAG: u8 = 1 << 6;
+const COOL_FLAG: u8 = 1 << 7;
+const MODE_FLAG: u8 = ENERGY_SAVER_FLAG | DRY_FLAG | FAN_FLAG | COOL_FLAG;
+
 #[derive(Debug, Clone, Copy)]
 enum FanSpeed {
     Low,
@@ -284,23 +301,18 @@ enum ReceivedGlyph {
 }
 
 enum Error {
-    BadParse(u8),
+    BadParse,
 }
 
 fn parse_received(byte: u8) -> Result<ReceivedGlyph, Error> {
-    match byte & 127 {
-        0b00111111 => Ok(ReceivedGlyph::Number(0)),
-        0b00000110 => Ok(ReceivedGlyph::Number(1)),
-        0b01011011 => Ok(ReceivedGlyph::Number(2)),
-        0b01001111 => Ok(ReceivedGlyph::Number(3)),
-        0b01100110 => Ok(ReceivedGlyph::Number(4)),
-        0b01101101 => Ok(ReceivedGlyph::Number(5)),
-        0b01111101 => Ok(ReceivedGlyph::Number(6)),
-        0b00000111 => Ok(ReceivedGlyph::Number(7)),
-        0b01111111 => Ok(ReceivedGlyph::Number(8)),
-        0b01101111 => Ok(ReceivedGlyph::Number(9)),
-        0b01110001 => Ok(ReceivedGlyph::Fan),
-        _ => Err(Error::BadParse(byte)),
+    for (i, itm) in DIGIT_PARSE_MAP.iter().enumerate() {
+        if byte & PARSE_MASK == *itm {
+            return Ok(ReceivedGlyph::Number(i as u8));
+        }
+    }
+    match byte & PARSE_MASK {
+        F_PARSE => Ok(ReceivedGlyph::Fan),
+        _ => Err(Error::BadParse),
     }
 }
 
@@ -655,12 +667,12 @@ async fn main(_spawner: Spawner) -> ! {
                                         if byte == 0 {
                                             state.config.on = false;
                                         } else {
-                                            if byte & 0b11001100 != 0 {
-                                                state.config.mode = match byte & 0b11001100 {
-                                                    128 => Mode::Cool,
-                                                    64 => Mode::Fan,
-                                                    8 => Mode::Dry,
-                                                    4 => Mode::EnergySaver,
+                                            if byte & MODE_FLAG != 0 {
+                                                state.config.mode = match byte & MODE_FLAG {
+                                                    COOL_FLAG => Mode::Cool,
+                                                    FAN_FLAG => Mode::Fan,
+                                                    DRY_FLAG => Mode::Dry,
+                                                    ENERGY_SAVER_FLAG => Mode::EnergySaver,
                                                     // _ => unreachable!(
                                                     //     "Byte had bad bit 0b{byte:08b} (masked 0b{:08b})", byte & 0b11001100
                                                     // ),
