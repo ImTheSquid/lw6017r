@@ -220,6 +220,7 @@ async fn display_task(
     mut buttons: Flex<'static, Gpio45>,
     state_recv: Receiver<'static, CriticalSectionRawMutex, DisplayState, 1>,
     button_alert: Sender<'static, CriticalSectionRawMutex, ButtonStatus, 1>,
+    d_recv: Receiver<'static, CriticalSectionRawMutex, u8, 1>,
 ) -> ! {
     let mut state = DisplayState::default();
 
@@ -238,7 +239,7 @@ async fn display_task(
         };
         if let Some(num) = num {
             digit1.set_high();
-            if num <= 3 {
+            if num <= 3 && num > 0 {
                 segments.display_letter('F', false);
             } else {
                 segments.display_number(num / 10, false);
@@ -267,11 +268,41 @@ async fn display_task(
 
         if let Ok(s) = state_recv.try_receive() {
             state = s;
+            // println!("{state:?}");
+        }
+        if let Ok(b) = d_recv.try_receive() {
+            println!("{b:08b}");
         }
     }
 }
 
 static mut APP_CORE_STACK: Stack<4096> = Stack::new();
+
+enum ReceivedGlyph {
+    Fan,
+    Number(u8),
+}
+
+enum Error {
+    BadParse(u8),
+}
+
+fn parse_received(byte: u8) -> Result<ReceivedGlyph, Error> {
+    match byte & 127 {
+        0b00111111 => Ok(ReceivedGlyph::Number(0)),
+        0b00000110 => Ok(ReceivedGlyph::Number(1)),
+        0b01011011 => Ok(ReceivedGlyph::Number(2)),
+        0b01001111 => Ok(ReceivedGlyph::Number(3)),
+        0b01100110 => Ok(ReceivedGlyph::Number(4)),
+        0b01101101 => Ok(ReceivedGlyph::Number(5)),
+        0b01111101 => Ok(ReceivedGlyph::Number(6)),
+        0b00000111 => Ok(ReceivedGlyph::Number(7)),
+        0b01111111 => Ok(ReceivedGlyph::Number(8)),
+        0b01101111 => Ok(ReceivedGlyph::Number(9)),
+        0b01110001 => Ok(ReceivedGlyph::Fan),
+        _ => Err(Error::BadParse(byte)),
+    }
+}
 
 #[main]
 async fn main(_spawner: Spawner) -> ! {
@@ -293,14 +324,14 @@ async fn main(_spawner: Spawner) -> ! {
 
     let mut io = Io::new(peripherals.GPIO, peripherals.IO_MUX);
 
-    io.set_interrupt_handler(stb_handler);
+    // io.set_interrupt_handler(stb_handler);
 
     // Setup data lines
     let mut stb = Input::new(io.pins.gpio5, Pull::Up);
     let mut data = Flex::new(io.pins.gpio2);
     data.set_as_input(Pull::Up);
     let clk = Input::new(io.pins.gpio4, Pull::None);
-    let irq_n = Output::new(io.pins.gpio6, Level::High);
+    let mut irq_n = Output::new(io.pins.gpio6, Level::High);
 
     // Setup buttons
     let buttons = Flex::new(io.pins.gpio45);
@@ -321,6 +352,10 @@ async fn main(_spawner: Spawner) -> ! {
     };
 
     // Channels
+    let d_channel: Channel<CriticalSectionRawMutex, u8, 1> = Channel::new();
+    let d_channel = make_static!(d_channel);
+    let d_channel_send = d_channel.sender();
+    let d_channel_recv = d_channel.receiver();
     let display_channel: Channel<CriticalSectionRawMutex, DisplayState, 1> = Channel::new();
     let display_channel = make_static!(display_channel);
     let display_channel_send = display_channel.sender();
@@ -330,7 +365,7 @@ async fn main(_spawner: Spawner) -> ! {
     let button_channel_send = button_channel.sender();
     let button_channel_recv = button_channel.receiver();
 
-    let state = State {
+    let mut state = State {
         up_button: debounce_stateful_12(false),
         down_button: debounce_stateful_12(false),
         power_button: debounce_stateful_12(false),
@@ -338,12 +373,12 @@ async fn main(_spawner: Spawner) -> ! {
         timer_button: debounce_stateful_12(false),
         fan_button: debounce_stateful_12(false),
         config: Config {
-            temperature: 72,
+            temperature: 00,
             fan_speed: FanSpeed::Low,
             timer: 0,
             replace: true,
-            mode: Mode::EnergySaver,
-            on: true,
+            mode: Mode::Dry,
+            on: false,
         },
     };
 
@@ -352,22 +387,22 @@ async fn main(_spawner: Spawner) -> ! {
             temp: state.config.temperature,
             remind: state.config.replace,
             timer: None,
-            mode: Some(state.config.mode),
+            mode: None,
             fan: None,
         })
         .await;
 
-    critical_section::with(|cs| {
-        stb.listen(Event::FallingEdge);
-        STB.borrow_ref_mut(cs).replace(stb);
-        DATA.borrow_ref_mut(cs).replace(data);
-        CLK.borrow_ref_mut(cs).replace(clk);
-        IRQ_N.borrow_ref_mut(cs).replace(irq_n);
-        DISPLAY_CHANNEL_SEND
-            .borrow_ref_mut(cs)
-            .replace(display_channel_send);
-        STATE.borrow_ref_mut(cs).replace(state);
-    });
+    // critical_section::with(|cs| {
+    //     stb.listen(Event::FallingEdge);
+    //     STB.borrow_ref_mut(cs).replace(stb);
+    //     DATA.borrow_ref_mut(cs).replace(data);
+    //     CLK.borrow_ref_mut(cs).replace(clk);
+    //     IRQ_N.borrow_ref_mut(cs).replace(irq_n);
+    //     DISPLAY_CHANNEL_SEND
+    //         .borrow_ref_mut(cs)
+    //         .replace(display_channel_send);
+    //     STATE.borrow_ref_mut(cs).replace(state);
+    // });
 
     // Spin off display process
     let _guard = cpu.start_app_core(unsafe { &mut *addr_of_mut!(APP_CORE_STACK) }, move || {
@@ -383,6 +418,7 @@ async fn main(_spawner: Spawner) -> ! {
                     buttons,
                     display_channel_recv,
                     button_channel_send,
+                    d_channel_recv,
                 ))
                 .ok();
         });
@@ -390,22 +426,59 @@ async fn main(_spawner: Spawner) -> ! {
 
     let _comm_enable = Output::new(io.pins.gpio1, Level::High);
 
+    // If STB is already low, lets wait for a new signal
+    while stb.is_low() {
+        log::info!("STB wait");
+    }
+
     loop {
         // log::info!("HEARTBEAT");
-        Timer::after_micros(DELAY).await;
-        if let Ok(ButtonStatus {
-            temp_up,
-            temp_down,
-            power,
-            timer,
-            mode,
-            fan,
-        }) = button_channel_recv.try_receive()
-        {
-            critical_section::with(|cs| {
-                let mut binding = STATE.borrow_ref_mut(cs);
-                let state = binding.as_mut().unwrap();
+        // Timer::after_micros(DELAY).await;
+        // if let Ok(ButtonStatus {
+        //     temp_up,
+        //     temp_down,
+        //     power,
+        //     timer,
+        //     mode,
+        //     fan,
+        // }) = button_channel_recv.try_receive()
+        // {
+        //     critical_section::with(|cs| {
+        //         let mut binding = STATE.borrow_ref_mut(cs);
+        //         let state = binding.as_mut().unwrap();
 
+        //         let interrupt = [
+        //             state.power_button.update(power),
+        //             state.fan_button.update(fan),
+        //             state.up_button.update(temp_up),
+        //             state.down_button.update(temp_down),
+        //             state.mode_button.update(mode),
+        //             state.timer_button.update(timer),
+        //         ];
+
+        //         let interrupt = interrupt
+        //             .iter()
+        //             .any(|e| e.is_some_and(|e| matches!(e, Edge::Rising)));
+
+        //         if interrupt {
+        //             log::info!("Button pressed, setting interrupt");
+        //             let mut binding = IRQ_N.borrow_ref_mut(cs);
+        //             let irq_n = binding.as_mut().unwrap();
+        //             irq_n.set_low();
+        //         }
+        //     });
+        // }
+
+        while stb.is_high() {
+            if let Ok(ButtonStatus {
+                temp_up,
+                temp_down,
+                power,
+                timer,
+                mode,
+                fan,
+            }) = button_channel_recv.try_receive()
+            {
                 let interrupt = [
                     state.power_button.update(power),
                     state.fan_button.update(fan),
@@ -420,11 +493,310 @@ async fn main(_spawner: Spawner) -> ! {
                     .any(|e| e.is_some_and(|e| matches!(e, Edge::Rising)));
 
                 if interrupt {
-                    log::info!("Button pressed, setting interrupt");
-                    let mut binding = IRQ_N.borrow_ref_mut(cs);
-                    let irq_n = binding.as_mut().unwrap();
-                    irq_n.set_high();
+                    // log::info!("Button pressed, setting interrupt");
+                    // let mut binding = IRQ_N.borrow_ref_mut(cs);
+                    // let irq_n = binding.as_mut().unwrap();
+                    irq_n.set_low();
                 }
+            }
+        }
+
+        data.set_as_input(Pull::Up);
+
+        let mut baker = ByteBaker::new(Order::LeastSignificant);
+
+        let mut parse_state = CommandParseState::NoCommand;
+
+        let mut fan_wait = false;
+
+        while stb.is_low() {
+            // Wait for clk to go low
+            while clk.is_high() && stb.is_low() {}
+
+            // If stb went high, break
+            if stb.is_high() {
+                break;
+            }
+
+            // Read some data
+            if let Some(byte) = baker.bake(data.is_high()) {
+                // println!("parsed byte 0b{byte:08b}");
+                // Check for obvious commands first, then fallback to state
+                match parse_state {
+                    CommandParseState::NoCommand => match byte & 0b01011111 {
+                        0b1101 => {
+                            // Display on, kinda a NOP
+                            // log::info!("DISPLAY STATE ON");
+                            // state.config.on = true;
+                        }
+                        0b1110 => {
+                            // log::info!("DISPLAY STATE OFF");
+                            // panic!("Display should never turn off");
+                            // state.config.on = false;
+                        }
+                        _ => {
+                            // At this point it has to be a read or write command, so extract necessary info
+                            let fixed = byte & 0b00100000 > 0;
+                            let mut address = byte & 0b111;
+                            let page = (byte & 0b11000) >> 3;
+
+                            if byte & 0b01000000 > 0 {
+                                while stb.is_low() {
+                                    if !validate_read_address(address, page) {
+                                        // log::error!(
+                                        //     "Invalid read from address {address} on page {page} (byte 0b{byte:08b})"
+                                        // );
+                                        break;
+                                    }
+
+                                    data.set_as_output();
+
+                                    let out = match address {
+                                        0 => {
+                                            state.config.replace as u8
+                                                | (matches!(state.config.mode, Mode::EnergySaver)
+                                                    as u8)
+                                                    << 2
+                                                | (matches!(state.config.mode, Mode::Fan) as u8)
+                                                    << 3
+                                                | ((state.config.timer > 0) as u8) << 5
+                                                | (matches!(state.config.mode, Mode::Dry) as u8)
+                                                    << 6
+                                                | (matches!(state.config.mode, Mode::Cool) as u8)
+                                                    << 7
+                                        }
+                                        1 => {
+                                            d_channel_send.try_send(255);
+                                            state.fan_button.is_high() as u8
+                                                | (state.down_button.is_high() as u8) << 2
+                                                | (state.up_button.is_high() as u8) << 3
+                                        }
+                                        2 => {
+                                            state.timer_button.is_high() as u8
+                                                | (state.mode_button.is_high() as u8) << 1
+                                                | (state.power_button.is_high() as u8) << 2
+                                        }
+                                        _ => unreachable!(),
+                                    };
+
+                                    for i in 0_u8..8 {
+                                        while clk.is_high() && stb.is_low() {}
+
+                                        if stb.is_high() {
+                                            break;
+                                        }
+
+                                        data.set_level(if out >> i & 1 == 1 {
+                                            Level::High
+                                        } else {
+                                            Level::Low
+                                        });
+
+                                        // Data is clocked out at falling edge
+                                        while clk.is_low() && stb.is_low() {}
+
+                                        if stb.is_high() {
+                                            break;
+                                        }
+                                    }
+
+                                    data.set_as_input(Pull::Up);
+
+                                    if address == 2 {
+                                        irq_n.set_high();
+                                    }
+
+                                    while clk.is_high() && stb.is_low() {}
+                                    if stb.is_high() {
+                                        break;
+                                    }
+
+                                    if !fixed {
+                                        address += 1;
+                                    }
+                                }
+                            } else {
+                                parse_state = CommandParseState::Write {
+                                    fixed,
+                                    address,
+                                    page,
+                                };
+                            }
+                        }
+                    },
+                    CommandParseState::Write {
+                        fixed,
+                        address,
+                        page,
+                    } => {
+                        // if !validate_write_address(address, page) {
+                        //     // log::error!(
+                        //     //     "Invalid write of 0b{byte:08b} to address {address} on page {page}"
+                        //     // );
+                        //     break;
+                        // }
+
+                        // let _ = d_channel_send.try_send(page);
+                        if byte == 255 {
+                            if !fixed {
+                                parse_state = CommandParseState::Write {
+                                    fixed,
+                                    address: address + 1,
+                                    page,
+                                };
+                            }
+                            continue;
+                        }
+
+                        match page {
+                            0 => {
+                                match address {
+                                    0 => {
+                                        if byte == 0 {
+                                            state.config.on = false;
+                                        } else {
+                                            if byte & 0b11001100 != 0 {
+                                                state.config.mode = match byte & 0b11001100 {
+                                                    128 => Mode::Cool,
+                                                    64 => Mode::Fan,
+                                                    8 => Mode::Dry,
+                                                    4 => Mode::EnergySaver,
+                                                    // _ => unreachable!(
+                                                    //     "Byte had bad bit 0b{byte:08b} (masked 0b{:08b})", byte & 0b11001100
+                                                    // ),
+                                                    _ => {
+                                                        if !fixed {
+                                                            parse_state =
+                                                                CommandParseState::Write {
+                                                                    fixed,
+                                                                    address: address + 1,
+                                                                    page,
+                                                                };
+                                                        }
+                                                        continue;
+                                                    }
+                                                };
+                                                state.config.on = true;
+                                            } else {
+                                                state.config.on = false;
+                                            }
+
+                                            state.config.replace = byte & 1 != 0;
+
+                                            // println!("CONFIG UPDATE");
+                                        }
+                                    }
+                                    2 => {
+                                        if byte == 0 {
+                                            state.config.on = false;
+                                        } else {
+                                            state.config.on = true;
+                                            if let Ok(parse) = parse_received(byte) {
+                                                match parse {
+                                                    ReceivedGlyph::Fan => {
+                                                        fan_wait = true;
+                                                    }
+                                                    ReceivedGlyph::Number(num) => {
+                                                        fan_wait = false;
+                                                        state.config.temperature =
+                                                            (state.config.temperature % 10)
+                                                                + 10 * num;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    1 => {
+                                        if byte == 0 {
+                                            state.config.on = false;
+                                        } else {
+                                            state.config.on = true;
+                                            if let Ok(parse) = parse_received(byte) {
+                                                match parse {
+                                                    ReceivedGlyph::Number(num) => {
+                                                        if fan_wait {
+                                                            state.config.fan_speed = match num {
+                                                                1 => FanSpeed::Low,
+                                                                2 => FanSpeed::Medium,
+                                                                3 => FanSpeed::High,
+                                                                _ => unreachable!(
+                                                                    "Invalid fan speed {num}"
+                                                                ),
+                                                            }
+                                                        } else {
+                                                            state.config.temperature =
+                                                                (state.config.temperature / 10)
+                                                                    * 10
+                                                                    + num;
+                                                        }
+                                                    }
+                                                    ReceivedGlyph::Fan => {}
+                                                }
+                                            }
+                                        }
+                                    }
+                                    _ => {} // log::error!("Received display byte 0b{byte:08b} at address 0x{address:02x} outside of displayable range, ignoring"),
+                                }
+                            }
+                            1 => {
+                                // if byte & 0b11001100 != 0 {
+                                //     state.config.mode = match byte & 0b11001100 {
+                                //         128 => Mode::Cool,
+                                //         64 => Mode::Dry,
+                                //         8 => Mode::Fan,
+                                //         4 => Mode::EnergySaver,
+                                //         _ => unreachable!(),
+                                //     };
+                                //     state.config.on = true;
+                                // } else {
+                                //     state.config.on = false;
+                                // }
+
+                                // state.config.replace = byte & 1 != 0;
+
+                                panic!("Nothing should ever be written here");
+
+                                // Deal with timer elsewhere
+                            }
+                            0b10 | 0b11 => {
+                                // Config information, not necessary
+                                // println!(
+                                //             "Received config byte 0b{byte:08b} at page 0x{page:02x} address 0x{address:02x}, ignoring"
+                                //         );
+                            }
+                            _ => unreachable!("Impossible read at page {page}"),
+                        }
+
+                        if !fixed {
+                            parse_state = CommandParseState::Write {
+                                fixed,
+                                address: address + 1,
+                                page,
+                            };
+                        }
+                    }
+                }
+            }
+
+            // Wait for clk to go high
+            while clk.is_low() && stb.is_low() {}
+        }
+
+        if !state.config.on {
+            let _ = display_channel_send.try_send(DisplayState {
+                temp: state.config.temperature,
+                remind: false,
+                timer: None,
+                mode: None,
+                fan: None,
+            });
+        } else {
+            let _ = display_channel_send.try_send(DisplayState {
+                temp: state.config.temperature,
+                remind: false,
+                timer: None,
+                mode: Some(state.config.mode),
+                fan: None,
             });
         }
     }
@@ -481,7 +853,7 @@ enum CommandParseState {
 }
 
 fn validate_write_address(address: u8, page: u8) -> bool {
-    let res = match page {
+    match page {
         // 7 segment
         0b00 => address <= 0x05,
         // LED
@@ -489,213 +861,221 @@ fn validate_write_address(address: u8, page: u8) -> bool {
         // Config
         0b10 | 0b11 => address <= 0x03,
         _ => false,
-    };
-
-    if !res {
-        log::error!("Invalid write to address {address} on page {page}");
     }
-
-    res
 }
 
 fn validate_read_address(address: u8, page: u8) -> bool {
-    let res = page == 1 && address <= 2;
-
-    if !res {
-        log::error!("Invalid read from address {address} on page {page}");
-    }
-
-    res
+    page == 1 && address <= 2
 }
 
-#[handler(priority = esp_hal::interrupt::Priority::Priority3)]
-fn stb_handler() {
-    println!("interrupt");
-    critical_section::with(|cs| {
-        // Start handling clock bits
-        let mut binding = STB.borrow_ref_mut(cs);
-        let stb = binding.as_mut().unwrap();
-        let mut binding = DATA.borrow_ref_mut(cs);
-        let data = binding.as_mut().unwrap();
-        let binding = CLK.borrow_ref(cs);
-        let clk = binding.as_ref().unwrap();
-        let mut binding = STATE.borrow_ref_mut(cs);
-        let state = binding.as_mut().unwrap();
-        let mut binding = IRQ_N.borrow_ref_mut(cs);
-        let irq_n = binding.as_mut().unwrap();
+// #[handler(priority = esp_hal::interrupt::Priority::Priority3)]
+// fn stb_handler() {
+//     // println!("interrupt");
+//     critical_section::with(|cs| {
+//         // Start handling clock bits
+//         let mut binding = STB.borrow_ref_mut(cs);
+//         let stb = binding.as_mut().unwrap();
+//         let mut binding = DATA.borrow_ref_mut(cs);
+//         let data = binding.as_mut().unwrap();
+//         let binding = CLK.borrow_ref(cs);
+//         let clk = binding.as_ref().unwrap();
+//         let mut binding = STATE.borrow_ref_mut(cs);
+//         let state = binding.as_mut().unwrap();
+//         let mut binding = IRQ_N.borrow_ref_mut(cs);
+//         let irq_n = binding.as_mut().unwrap();
+//         let binding = DISPLAY_CHANNEL_SEND.borrow_ref_mut(cs);
+//         let display_channel_send = binding.as_ref().unwrap();
 
-        data.set_as_input(Pull::Up);
+//         data.set_as_input(Pull::Up);
 
-        let mut baker = ByteBaker::new(Order::LeastSignificant);
+//         let mut baker = ByteBaker::new(Order::LeastSignificant);
 
-        let mut parse_state = CommandParseState::NoCommand;
+//         let mut parse_state = CommandParseState::NoCommand;
 
-        while stb.is_low() {
-            // Wait for clk to go low
-            while clk.is_high() && stb.is_low() {}
+//         while stb.is_low() {
+//             // Wait for clk to go low
+//             while clk.is_high() && stb.is_low() {}
 
-            // If stb went high, break
-            if stb.is_high() {
-                break;
-            }
+//             // If stb went high, break
+//             if stb.is_high() {
+//                 break;
+//             }
 
-            // Read some data
-            if let Some(byte) = baker.bake(data.is_high()) {
-                println!("parsed byte 0b{byte:08b}");
-                // Check for obvious commands first, then fallback to state
-                match parse_state {
-                    CommandParseState::NoCommand => match byte & 0b01011111 {
-                        0b00001101 => {
-                            state.config.on = true;
-                        }
-                        0b00001110 => {
-                            state.config.on = false;
-                        }
-                        _ => {
-                            // At this point it has to be a read or write command, so extract necessary info
-                            let fixed = byte & 0b00100000 > 0;
-                            let mut address = byte & 0b111;
-                            let page = (byte & 0b11000) >> 3;
+//             // Read some data
+//             if let Some(byte) = baker.bake(data.is_high()) {
+//                 // println!("parsed byte 0b{byte:08b}");
+//                 // Check for obvious commands first, then fallback to state
+//                 match parse_state {
+//                     CommandParseState::NoCommand => match byte & 0b01011111 {
+//                         0b00001101 => {
+//                             state.config.on = true;
+//                         }
+//                         0b00001110 => {
+//                             state.config.on = false;
+//                         }
+//                         _ => {
+//                             // At this point it has to be a read or write command, so extract necessary info
+//                             let fixed = byte & 0b00100000 > 0;
+//                             let mut address = byte & 0b111;
+//                             let page = (byte & 0b11000) >> 3;
 
-                            if byte & 0b01000000 > 0 {
-                                while stb.is_low() {
-                                    if !validate_read_address(address, page) {
-                                        break;
-                                    }
+//                             if byte & 0b01000000 > 0 {
+//                                 while stb.is_low() {
+//                                     if !validate_read_address(address, page) {
+//                                         break;
+//                                     }
 
-                                    data.set_as_output();
+//                                     data.set_as_output();
 
-                                    let out = match address {
-                                        0 => {
-                                            state.config.replace as u8
-                                                | (matches!(state.config.mode, Mode::EnergySaver)
-                                                    as u8)
-                                                    << 2
-                                                | (matches!(state.config.mode, Mode::Fan) as u8)
-                                                    << 3
-                                                | ((state.config.timer > 0) as u8) << 5
-                                                | (matches!(state.config.mode, Mode::Dry) as u8)
-                                                    << 6
-                                                | (matches!(state.config.mode, Mode::Cool) as u8)
-                                                    << 7
-                                        }
-                                        1 => {
-                                            state.fan_button.is_high() as u8
-                                                | (state.down_button.is_high() as u8) << 2
-                                                | (state.up_button.is_high() as u8) << 3
-                                        }
-                                        2 => {
-                                            state.timer_button.is_high() as u8
-                                                | (state.mode_button.is_high() as u8) << 1
-                                                | (state.power_button.is_high() as u8) << 2
-                                        }
-                                        _ => unreachable!(),
-                                    };
+//                                     let out = match address {
+//                                         0 => {
+//                                             state.config.replace as u8
+//                                                 | (matches!(state.config.mode, Mode::EnergySaver)
+//                                                     as u8)
+//                                                     << 2
+//                                                 | (matches!(state.config.mode, Mode::Fan) as u8)
+//                                                     << 3
+//                                                 | ((state.config.timer > 0) as u8) << 5
+//                                                 | (matches!(state.config.mode, Mode::Dry) as u8)
+//                                                     << 6
+//                                                 | (matches!(state.config.mode, Mode::Cool) as u8)
+//                                                     << 7
+//                                         }
+//                                         1 => {
+//                                             state.fan_button.is_high() as u8
+//                                                 | (state.down_button.is_high() as u8) << 2
+//                                                 | (state.up_button.is_high() as u8) << 3
+//                                         }
+//                                         2 => {
+//                                             state.timer_button.is_high() as u8
+//                                                 | (state.mode_button.is_high() as u8) << 1
+//                                                 | (state.power_button.is_high() as u8) << 2
+//                                         }
+//                                         _ => unreachable!(),
+//                                     };
 
-                                    for i in 0_u8..8 {
-                                        while clk.is_low() && stb.is_low() {}
+//                                     for i in 0_u8..8 {
+//                                         while clk.is_low() && stb.is_low() {}
 
-                                        if stb.is_high() {
-                                            break;
-                                        }
+//                                         if stb.is_high() {
+//                                             break;
+//                                         }
 
-                                        data.set_level(if out >> i & 1 == 1 {
-                                            Level::High
-                                        } else {
-                                            Level::Low
-                                        });
+//                                         data.set_level(if out >> i & 1 == 1 {
+//                                             Level::High
+//                                         } else {
+//                                             Level::Low
+//                                         });
 
-                                        // Data is clocked out at falling edge
-                                        while clk.is_high() && stb.is_low() {}
+//                                         // Data is clocked out at falling edge
+//                                         while clk.is_high() && stb.is_low() {}
 
-                                        if stb.is_high() {
-                                            break;
-                                        }
-                                    }
+//                                         if stb.is_high() {
+//                                             break;
+//                                         }
+//                                     }
 
-                                    data.set_as_input(Pull::Up);
+//                                     data.set_as_input(Pull::Up);
 
-                                    if address == 2 {
-                                        irq_n.set_low();
-                                    }
+//                                     if address == 2 {
+//                                         irq_n.set_low();
+//                                     }
 
-                                    while clk.is_high() && stb.is_low() {}
-                                    if stb.is_high() {
-                                        break;
-                                    }
+//                                     while clk.is_high() && stb.is_low() {}
+//                                     if stb.is_high() {
+//                                         break;
+//                                     }
 
-                                    if !fixed {
-                                        address += 1;
-                                    }
-                                }
-                            } else {
-                                parse_state = CommandParseState::Write {
-                                    fixed,
-                                    address,
-                                    page,
-                                };
-                            }
-                        }
-                    },
-                    CommandParseState::Write {
-                        fixed,
-                        address,
-                        page,
-                    } => {
-                        if !validate_write_address(address, page) {
-                            break;
-                        }
+//                                     if !fixed {
+//                                         address += 1;
+//                                     }
+//                                 }
+//                             } else {
+//                                 parse_state = CommandParseState::Write {
+//                                     fixed,
+//                                     address,
+//                                     page,
+//                                 };
+//                             }
+//                         }
+//                     },
+//                     CommandParseState::Write {
+//                         fixed,
+//                         address,
+//                         page,
+//                     } => {
+//                         if !validate_write_address(address, page) {
+//                             break;
+//                         }
 
-                        match page {
-                            0 => {
-                                if address <= 1 {
-                                    println!("recv display byte 0b{byte:08b}");
-                                } else {
-                                    println!("Received display byte 0b{byte:08b} at address 0x{address:02x} outside of displayable range, ignoring");
-                                }
-                            }
-                            1 => {
-                                if byte & 0b11001100 != 0 {
-                                    state.config.mode = match byte & 0b11001100 {
-                                        128 => Mode::Cool,
-                                        64 => Mode::Dry,
-                                        8 => Mode::Fan,
-                                        4 => Mode::EnergySaver,
-                                        _ => unreachable!(),
-                                    };
-                                    state.config.on = true;
-                                } else {
-                                    state.config.on = false;
-                                }
+//                         match page {
+//                             0 => {
+//                                 if address <= 1 {
+//                                     println!("recv display byte 0b{byte:08b}");
+//                                 } else {
+//                                     println!("Received display byte 0b{byte:08b} at address 0x{address:02x} outside of displayable range, ignoring");
+//                                 }
+//                             }
+//                             1 => {
+//                                 if byte & 0b11001100 != 0 {
+//                                     state.config.mode = match byte & 0b11001100 {
+//                                         128 => Mode::Cool,
+//                                         64 => Mode::Dry,
+//                                         8 => Mode::Fan,
+//                                         4 => Mode::EnergySaver,
+//                                         _ => unreachable!(),
+//                                     };
+//                                     state.config.on = true;
+//                                 } else {
+//                                     state.config.on = false;
+//                                 }
 
-                                state.config.replace = byte & 1 != 0;
+//                                 state.config.replace = byte & 1 != 0;
 
-                                // Deal with timer elsewhere
-                            }
-                            0x10 | 0x11 => {
-                                // Config information, not necessary
-                                println!(
-                                    "Received config byte 0b{byte:08b} at page 0x{page:02x} address 0x{address:02x}, ignoring"
-                                );
-                            }
-                            _ => unreachable!(),
-                        }
+//                                 // Deal with timer elsewhere
+//                             }
+//                             0x10 | 0x11 => {
+//                                 // Config information, not necessary
+//                                 println!(
+//                                     "Received config byte 0b{byte:08b} at page 0x{page:02x} address 0x{address:02x}, ignoring"
+//                                 );
+//                             }
+//                             _ => unreachable!(),
+//                         }
 
-                        if !fixed {
-                            parse_state = CommandParseState::Write {
-                                fixed,
-                                address: address + 1,
-                                page,
-                            };
-                        }
-                    }
-                }
-            }
+//                         if !fixed {
+//                             parse_state = CommandParseState::Write {
+//                                 fixed,
+//                                 address: address + 1,
+//                                 page,
+//                             };
+//                         }
+//                     }
+//                 }
+//             }
 
-            // Wait for clk to go high
-            while clk.is_low() && stb.is_low() {}
-        }
+//             // Wait for clk to go high
+//             while clk.is_low() && stb.is_low() {}
+//         }
 
-        stb.clear_interrupt();
-    });
-}
+//         if !state.config.on {
+//             let _ = display_channel_send.try_send(DisplayState {
+//                 temp: 69,
+//                 remind: false,
+//                 timer: None,
+//                 mode: Some(Mode::Dry),
+//                 fan: None,
+//             });
+//         } else {
+//             let _ = display_channel_send.try_send(DisplayState {
+//                 temp: 70,
+//                 remind: false,
+//                 timer: None,
+//                 mode: Some(Mode::Cool),
+//                 fan: None,
+//             });
+//         }
+
+//         stb.clear_interrupt();
+//     });
+// }
